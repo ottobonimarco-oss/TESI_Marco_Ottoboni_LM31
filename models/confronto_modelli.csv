@@ -1,0 +1,26 @@
+Indicatore,Descrizione,Modello,MAE,RMSE,R2,R2_CV_media,R2_CV_std
+V11110,Numero di imprese,Baseline (Mediana Storica),47890.33,184507.59,0.9943,,
+V11110,Numero di imprese,Ridge,781155.93,1703752.33,0.5146,0.5001,0.0519
+V11110,Numero di imprese,Random Forest,106134.26,208766.39,0.9927,0.8344,0.1834
+V11110,Numero di imprese,Gradient Boosting,106733.82,161832.52,0.9956,0.9969,0.0004
+V11110,Numero di imprese,MLP Regressor,552766.65,2507043.46,-0.0511,-0.0531,0.0068
+V12110,Fatturato (M€),Baseline (Mediana Storica),75653.75,342043.56,0.9849,,
+V12110,Fatturato (M€),Ridge,988109.65,1957924.37,0.5061,0.5204,0.0167
+V12110,Fatturato (M€),Random Forest,116272.95,244607.13,0.9923,0.8341,0.1845
+V12110,Fatturato (M€),Gradient Boosting,113379.52,183981.48,0.9956,0.995,0.002
+V12110,Fatturato (M€),MLP Regressor,629238.45,2856099.72,-0.051,-0.057,0.0116
+V12120,Valore della produzione (M€),Baseline (Mediana Storica),57811.24,254651.81,0.9825,,
+V12120,Valore della produzione (M€),Ridge,667504.96,1345787.66,0.5125,0.5398,0.0401
+V12120,Valore della produzione (M€),Random Forest,88150.45,192341.77,0.99,0.8208,0.1944
+V12120,Valore della produzione (M€),Gradient Boosting,85005.75,137311.99,0.9949,0.9945,0.0014
+V12120,Valore della produzione (M€),MLP Regressor,441485.64,1977353.66,-0.0525,-0.0594,0.0081
+V12130,Valore aggiunto (M€),Baseline (Mediana Storica),202.06,944.56,-63.5234,,
+V12130,Valore aggiunto (M€),Ridge,144.74,473.89,-15.2408,-14.2491,25.6781
+V12130,Valore aggiunto (M€),Random Forest,100.64,356.98,-8.216,-17.9066,32.6685
+V12130,Valore aggiunto (M€),Gradient Boosting,40.78,97.29,0.3155,-24.2129,49.3175
+V12130,Valore aggiunto (M€),MLP Regressor,91.94,117.64,-0.0009,-0.3511,0.8019
+V12150,Spese per il personale (M€),Baseline (Mediana Storica),30196.4,133480.48,0.9668,,
+V12150,Spese per il personale (M€),Ridge,250084.25,515118.7,0.5055,0.5124,0.0579
+V12150,Spese per il personale (M€),Random Forest,37895.36,86544.22,0.986,0.8079,0.1879
+V12150,Spese per il personale (M€),Gradient Boosting,34393.51,56246.54,0.9941,0.9936,0.0014
+V12150,Spese per il personale (M€),MLP Regressor,171043.25,752203.97,-0.0545,-0.0604,0.0064
