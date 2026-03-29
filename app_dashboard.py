@@ -45,6 +45,20 @@ IND_DESCRIPTIONS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ORIENTAMENTO DEGLI INDICATORI (per Tab 5 – Valutazione Aziendale)
+# "positive" = più alto è meglio (ricavi, valore aggiunto, produzione)
+# "cost"     = più alto = costi maggiori → interpretazione INVERTITA
+# "count"    = conteggio settoriale, non metrica di performance individuale
+# ─────────────────────────────────────────────────────────────────────────────
+INDICATOR_ORIENTATION = {
+    "V11110": "count",
+    "V12110": "positive",
+    "V12120": "positive",
+    "V12130": "positive",
+    "V12150": "cost",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DIZIONARIO CODICI NACE Rev. 2  (Eurostat SBS)
 # Fonte: Eurostat / NACE Rev. 2 – Regolamento CE n. 1893/2006
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,6 +607,58 @@ def carica_fi():
     except Exception:
         return None
 
+@st.cache_data
+def stats_settore_indicatore(indicatore: str, settore: str):
+    """
+    Statistiche di distribuzione storica per (indicatore, settore NACE).
+
+    Restituisce due livelli di statistiche:
+    1. Aggregato di settore (valori Eurostat SBS come presenti nel dataset)
+    2. Per-impresa (aggregato diviso per V11110 – numero di imprese)
+       disponibile per tutti gli indicatori monetari (non per V11110 stesso).
+
+    Usato nel form Tab 5 per mostrare range realistici a livello di singola PMI.
+    """
+    df = carica_dati()
+    df_ind = df[(df["indic_sb"] == indicatore) & (df["nace_r2"] == settore)].copy()
+    if len(df_ind) < 3:
+        return None
+
+    vals = df_ind["OBS_VALUE"].dropna()
+    res = dict(
+        p5      = float(vals.quantile(0.05)),
+        p25     = float(vals.quantile(0.25)),
+        mediana = float(vals.median()),
+        media   = float(vals.mean()),
+        p75     = float(vals.quantile(0.75)),
+        p95     = float(vals.quantile(0.95)),
+        std     = float(vals.std()),
+        n       = int(len(vals)),
+    )
+
+    # ── Stima per-impresa (solo per indicatori monetari) ──────────────────────
+    if indicatore != "V11110":
+        df_n = df[(df["indic_sb"] == "V11110") & (df["nace_r2"] == settore)][
+            ["geo", "TIME_PERIOD", "OBS_VALUE"]
+        ].rename(columns={"OBS_VALUE": "n_ent"})
+
+        if len(df_n) > 0:
+            df_m = df_ind.merge(df_n, on=["geo", "TIME_PERIOD"], how="left")
+            df_m["n_ent"] = pd.to_numeric(df_m["n_ent"], errors="coerce").replace(0, np.nan)
+            df_m["val_pe"] = df_m["OBS_VALUE"] / df_m["n_ent"]
+            pe = df_m["val_pe"].dropna()
+            if len(pe) >= 3:
+                res.update(dict(
+                    pe_p5      = float(pe.quantile(0.05)),
+                    pe_p25     = float(pe.quantile(0.25)),
+                    pe_mediana = float(pe.median()),
+                    pe_p75     = float(pe.quantile(0.75)),
+                    pe_p95     = float(pe.quantile(0.95)),
+                    pe_std     = float(pe.std()),
+                    pe_n       = int(len(pe)),
+                ))
+    return res
+
 
 df_full = carica_dati()
 paesi   = sorted(df_full["geo"].unique())
@@ -1087,18 +1153,31 @@ specificate (paese, settore, anno). Questo valore rappresenta il *benchmark di s
     # ── Form di input ──────────────────────────────────────────────────────────
     st.markdown("#### Dati azienda da valutare")
 
+    # Settori e paesi disponibili nel dataset (non tutti i codici NACE)
+    _SETTORI_DATI = sorted(df_full["nace_r2"].unique())
+    _PAESI_DATI   = sorted(df_full["geo"].unique())
+    _EU_AGGREGATI = {"EU27_2020", "EU28"}
+    # V12130 presente solo nel dataset per settore B
+    _V12130_SETTORI_CON_DATI = sorted(
+        df_full[df_full["indic_sb"] == "V12130"]["nace_r2"].unique())
+
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
         val_paese = st.selectbox(
             "🌍 Paese",
-            paesi,
-            index=paesi.index("IT") if "IT" in paesi else 0,
+            _PAESI_DATI,
+            index=_PAESI_DATI.index("IT") if "IT" in _PAESI_DATI else 0,
             key="val_paese",
         )
+        if val_paese in _EU_AGGREGATI:
+            st.caption(
+                f"⚠️ **{val_paese}** è un aggregato europeo (non un singolo paese). "
+                "Il benchmark per-PMI sarà la media su tutte le PMI dell'UE, "
+                "non quella nazionale.")
     with fc2:
         val_settore = st.selectbox(
             "🏭 Settore NACE",
-            settori,
+            _SETTORI_DATI,
             format_func=nace_label,
             key="val_settore",
         )
@@ -1120,18 +1199,134 @@ specificate (paese, settore, anno). Questo valore rappresenta il *benchmark di s
             key="val_ind",
         )
         st.caption(f"ℹ️ {IND_DESCRIPTIONS[val_indicatore]}")
+        # Avviso: V12130 presente solo per alcuni settori nel dataset
+        if val_indicatore == "V12130" and val_settore not in _V12130_SETTORI_CON_DATI:
+            st.warning(
+                f"⚠️ **V12130 – Valore aggiunto** non è disponibile nel dataset "
+                f"per il settore **{val_settore}**. Il benchmark ML sarà una "
+                "stima per estrapolazione dal settore B (Estrazione minerali). "
+                "Interpretare il risultato con cautela.")
+        # Avviso: V12130 può avere valori e benchmark negativi nel settore B
+        if val_indicatore == "V12130" and val_settore == "B":
+            st.info(
+                "ℹ️ **V12130 – Valore aggiunto** nel settore **B** (Estrazione minerali) "
+                "può assumere valori negativi in alcuni paesi/anni (circa 8% dei dati "
+                "storici). Un benchmark ML negativo indica che il settore è mediamente "
+                "in perdita operativa netta in quel contesto.")
     with fv2:
+        # Carica statistiche di settore per range e default realistici
+        _rng = stats_settore_indicatore(val_indicatore, val_settore)
+        _default_val = float(round(_rng["mediana"], 2)) if _rng else 1000.0
+        _step_val    = max(1.0, float(round(_rng["std"] / 100, 1))) if _rng else 10.0
+
+        _orient_rng = INDICATOR_ORIENTATION.get(val_indicatore, "positive")
         val_reale = st.number_input(
             f"💰 Valore reale azienda  ({IND_LABELS.get(val_indicatore, '')})",
-            min_value=0.0, value=1000.0, step=10.0,
-            format="%.2f", key="val_reale",
+            min_value=0.0,
+            value=_default_val,
+            step=_step_val,
+            format="%.2f",
+            key="val_reale",
         )
+
+        # ── Hint rapido: range di valori realistici ────────────────────────────
+        if _rng and _orient_rng != "count":
+            _has_pe_hint = "pe_mediana" in _rng
+            if _has_pe_hint:
+                _hint_lo = max(0.0, _rng["pe_p5"])
+                _hint_hi = _rng["pe_p95"]
+            else:
+                _hint_lo = max(0.0, _rng["p5"])
+                _hint_hi = _rng["p95"]
+            _cost_note = " · valori più bassi = maggiore efficienza" if _orient_rng == "cost" else ""
+            st.caption(
+                f"📝 Inserisci un valore indicativamente tra **{_hint_lo:,.2f}** "
+                f"e **{_hint_hi:,.2f}** M€  (P5–P95 settore {val_settore}){_cost_note}"
+            )
+
+        # ── Guida ai range realistici per settore ─────────────────────────────
+        if _rng:
+            _has_pe = "pe_mediana" in _rng
+
+            if _orient_rng == "count":
+                # V11110: è un conteggio settoriale, non metrica aziendale
+                st.markdown(
+                    f"<div style='background:#2a1e3a;border-left:3px solid #9b59b6;"
+                    f"padding:8px 12px;border-radius:4px;margin-top:6px;"
+                    f"font-size:0.82em;line-height:1.8;'>"
+                    f"<b>⚠️ {val_indicatore} – Conteggio settoriale</b><br>"
+                    f"Questo indicatore misura quante PMI esistono nel settore. "
+                    f"Non è una metrica di performance individuale.<br>"
+                    f"Range storico (n° imprese nel settore, tutti i paesi):<br>"
+                    f"&nbsp;&nbsp;Min = {_rng['p5']:,.0f} | Mediana = {_rng['mediana']:,.0f} | "
+                    f"Max = {_rng['p95']:,.0f}</div>",
+                    unsafe_allow_html=True,
+                )
+            elif _has_pe:
+                # Indicatori monetari: mostra sia aggregato sia per-impresa
+                if _orient_rng == "cost":
+                    _lbl_hi = "🔴 P95 (costi più alti)"
+                    _lbl_lo = "🟢 P5  (costi più bassi)"
+                    _note   = "Per i costi: <b>valori più bassi = maggiore efficienza</b>."
+                else:
+                    _lbl_hi = "🟢 P95 (alta performance)"
+                    _lbl_lo = "🔴 P5  (bassa performance)"
+                    _note   = "Per i ricavi/VA: <b>valori più alti = migliore performance</b>."
+
+                st.markdown(
+                    f"<div style='background:#1e2a3a;border-left:3px solid #3498db;"
+                    f"padding:8px 12px;border-radius:4px;margin-top:6px;"
+                    f"font-size:0.82em;line-height:1.8;'>"
+                    f"<b>📊 Range per singola impresa</b> "
+                    f"– settore <code>{val_settore}</code> ({_rng['pe_n']} osservazioni)<br>"
+                    f"<i>Aggregato Eurostat ÷ N° imprese (V11110) – scala realistica per PMI</i><br>"
+                    f"{_lbl_hi}&nbsp;≥ <b>{_rng['pe_p95']:,.2f} M€</b><br>"
+                    f"🔵 P75&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                    f"≥ <b>{_rng['pe_p75']:,.2f} M€</b><br>"
+                    f"⚪ Mediana&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                    f"≈ <b>{_rng['pe_mediana']:,.2f} M€</b><br>"
+                    f"🟡 P25&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                    f"≤ <b>{_rng['pe_p25']:,.2f} M€</b><br>"
+                    f"{_lbl_lo}&nbsp;≤ <b>{_rng['pe_p5']:,.2f} M€</b><br>"
+                    f"<span style='color:#aaa;font-size:0.9em;'>{_note}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Fallback: aggregato di settore
+                st.markdown(
+                    f"<div style='background:#1e2a3a;border-left:3px solid #e67e22;"
+                    f"padding:8px 12px;border-radius:4px;margin-top:6px;"
+                    f"font-size:0.82em;line-height:1.8;'>"
+                    f"<b>📊 Aggregato di settore <code>{val_settore}</code></b>"
+                    f" ({_rng['n']} osservazioni)<br>"
+                    f"<i>Valori aggregati Eurostat (tutte le PMI del settore/paese/anno)</i><br>"
+                    f"Mediana = {_rng['mediana']:,.0f} | "
+                    f"P25 = {_rng['p25']:,.0f} | P75 = {_rng['p75']:,.0f}</div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("ℹ️ Statistiche settore non disponibili per questa combinazione.")
 
     st.markdown("")
     btn_valuta = st.button("▶ Valuta l'azienda", type="primary",
                            use_container_width=False)
 
     if btn_valuta:
+        _orient_v = INDICATOR_ORIENTATION.get(val_indicatore, "positive")
+
+        # ── Avviso speciale per V11110 (conteggio settoriale) ──────────────────
+        if _orient_v == "count":
+            st.warning(
+                f"**{val_indicatore} – {IND_LABELS[val_indicatore]}** è un indicatore "
+                "di **dimensione settoriale** (quante PMI esistono nel settore), non "
+                "una metrica di performance della singola azienda. Non è possibile "
+                "confrontare il valore della tua azienda con questo aggregato. "
+                "Per valutare la performance usa: **V12110 Fatturato**, "
+                "**V12130 Valore aggiunto** o **V12150 Spese per il personale**."
+            )
+            st.stop()
+
         # ── Carica modelli ─────────────────────────────────────────────────────
         pay_v = carica_modello(val_indicatore)
         kd_v  = carica_kmeans(val_indicatore)
@@ -1139,113 +1334,248 @@ specificate (paese, settore, anno). Questo valore rappresenta il *benchmark di s
         if pay_v is None:
             st.error("Modello ML non trovato. Avvia prima il training dalla sidebar.")
         else:
-            # ── Previsione benchmark ML ────────────────────────────────────────
+            # ── Previsione benchmark ML (aggregato di settore) ─────────────────
             Xnew = pd.DataFrame({
                 "nace_r2":     [val_settore],
                 "geo":         [val_paese],
                 "TIME_PERIOD": [val_anno],
             })
             try:
-                benchmark = float(pay_v["model"].predict(Xnew)[0])
+                benchmark_agg = float(pay_v["model"].predict(Xnew)[0])
             except Exception as ex:
                 st.error(f"Errore nella previsione: {ex}")
                 st.stop()
 
-            gap_abs = val_reale - benchmark
-            gap_pct = (gap_abs / benchmark * 100) if benchmark != 0 else 0.0
+            # ── Normalizzazione per-impresa (aggregato ÷ V11110) ───────────────
+            n_ent_v = None
+            try:
+                r_n = df_full[
+                    (df_full["indic_sb"] == "V11110") &
+                    (df_full["nace_r2"]  == val_settore) &
+                    (df_full["geo"]      == val_paese) &
+                    (df_full["TIME_PERIOD"] == val_anno)
+                ]["OBS_VALUE"].dropna()
+                if len(r_n) > 0 and float(r_n.iloc[0]) > 0:
+                    n_ent_v = float(r_n.iloc[0])
+                else:
+                    # Fallback: media degli anni disponibili
+                    r_n2 = df_full[
+                        (df_full["indic_sb"] == "V11110") &
+                        (df_full["nace_r2"]  == val_settore) &
+                        (df_full["geo"]      == val_paese)
+                    ]["OBS_VALUE"].dropna()
+                    if len(r_n2) > 0 and r_n2.mean() > 0:
+                        n_ent_v = float(r_n2.mean())
+            except Exception:
+                pass
 
-            # ── Z-score e profilo clustering ───────────────────────────────────
-            zscore_val   = None
-            profilo_val  = "N/D"
-            mu_val       = None
-            sigma_val    = None
+            benchmark_pe = (benchmark_agg / n_ent_v
+                            if n_ent_v and n_ent_v > 0 else None)
+
+            # Usa per-impresa come benchmark primario; aggregato come secondario
+            benchmark = benchmark_pe if benchmark_pe is not None else benchmark_agg
+            gap_abs   = val_reale - benchmark
+            gap_pct   = (gap_abs / benchmark * 100) if benchmark != 0 else 0.0
+
+            # ── Benchmark negativo (es. V12130/B con VA negativo) ──────────────
+            # Quando benchmark < 0, la formula gap_pct = (val-bench)/bench*100
+            # INVERTE il segno: val=0, bench=-0.5 → gap = -100% (sbagliato!).
+            # In realtà val_reale=0 è MIGLIORE di benchmark=-0.5 (VA negativo).
+            # Fix: si disabilita gap_pct come segnale di classificazione;
+            #       la decisione si basa solo sullo z-score.
+            _bench_negativo = benchmark < 0
+            # gap_pct usato per classificazione (0 se bench < 0, non affidabile)
+            _gp_class = 0.0 if _bench_negativo else gap_pct
+
+            # ── Z-score (su valori per-impresa se disponibili) ─────────────────
+            zscore_val  = None
+            profilo_val = "N/D"
+            mu_val      = None
+            sigma_val   = None
 
             if kd_v is not None:
                 try:
                     if "sector_stats" in kd_v and val_settore in kd_v["sector_stats"].index:
-                        mu_val    = float(kd_v["sector_stats"].loc[val_settore, "mu"])
-                        sigma_val = float(kd_v["sector_stats"].loc[val_settore, "sigma"])
+                        mu_agg    = float(kd_v["sector_stats"].loc[val_settore, "mu"])
+                        sig_agg   = float(kd_v["sector_stats"].loc[val_settore, "sigma"])
                     else:
-                        mu_val    = float(df_full[
-                            (df_full["indic_sb"] == val_indicatore)
-                        ]["OBS_VALUE"].median())
-                        sigma_val = 1.0
-                    sigma_val = max(sigma_val, 1e-6)
+                        mu_agg  = float(df_full[df_full["indic_sb"] == val_indicatore
+                                                ]["OBS_VALUE"].median())
+                        sig_agg = 1.0
+                    sig_agg = max(sig_agg, 1e-6)
+
+                    # Normalizza mu/sigma alla scala per-impresa
+                    if n_ent_v and n_ent_v > 0:
+                        mu_val    = mu_agg  / n_ent_v
+                        sigma_val = sig_agg / n_ent_v
+                    else:
+                        mu_val    = mu_agg
+                        sigma_val = sig_agg
+                    sigma_val = max(sigma_val, 1e-9)
+
                     zscore_val  = float(np.clip(
                         (val_reale - mu_val) / sigma_val, -3, 3))
-                    Xcl_v = kd_v["scaler"].transform([[zscore_val, val_anno]])
+                    Xcl_v = kd_v["scaler"].transform(
+                        [[float(np.clip((val_reale * (n_ent_v or 1) - mu_agg) / sig_agg, -3, 3)),
+                          val_anno]])
                     lbl_v = int(kd_v["km"].predict(Xcl_v)[0])
                     profilo_val = kd_v["label_map"].get(lbl_v, "N/D")
                 except Exception:
                     pass
 
-            # ── Output sezione KPI ─────────────────────────────────────────────
+            # ── Determina fascia interpretativa ───────────────────────────────
+            # Principi:
+            #  • Indicatori positivi (V12110/20/30): valori alti = meglio
+            #  • Indicatori di costo  (V12150):      valori bassi = meglio
+            #  • Se benchmark < 0: gap_pct è matematicamente invertito →
+            #    si usa SOLO lo z-score (già corretto per distribuzioni asimmetriche)
+            #  • Safety net: gap_pct estremo (±50% / ±100%) integra lo z-score
+            #    per distribuzioni ad alta varianza (σ >> μ)
+            _z  = zscore_val if zscore_val is not None else 0.0
+            _gp = _gp_class   # 0 se benchmark negativo, altrimenti gap_pct reale
+
+            if _orient_v == "cost":
+                if _z <= -0.5 or _gp <= -50:
+                    fascia_interp = "Efficienza Costi"
+                elif _z >= 0.5 or _gp >= 50:
+                    fascia_interp = "Costi Elevati"
+                else:
+                    fascia_interp = "Costi Allineati"
+            else:
+                _z_alta  = (zscore_val is not None and _z >= 0.5) or _gp >= 100
+                _z_bassa = (zscore_val is not None and _z <= -0.5) or _gp <= -50
+                if _z_alta and not _z_bassa:
+                    fascia_interp = "Alta Performance"
+                elif _z_bassa:
+                    fascia_interp = "Bassa Performance"
+                else:
+                    fascia_interp = "Media Performance"
+
+            # ── Nota metodologica ──────────────────────────────────────────────
             st.markdown("---")
+
+            # Avviso benchmark negativo (V12130 settore B in alcuni contesti)
+            if _bench_negativo:
+                st.warning(
+                    f"⚠️ **Benchmark ML negativo** ({benchmark:,.4f} M€): il modello "
+                    f"prevede un valore aggregato negativo per "
+                    f"**{val_indicatore} – {IND_LABELS[val_indicatore]}** "
+                    f"in {val_paese} – {val_settore} ({val_anno}). "
+                    "Questo è economicamente possibile per il **Valore Aggiunto** "
+                    "nel settore estrattivo (costi > ricavi). "
+                    "Il confronto percentuale (gap%) non è applicabile con benchmark negativo: "
+                    "la valutazione si basa **esclusivamente sullo z-score**."
+                )
+
+            if benchmark_pe is not None:
+                st.info(
+                    f"📐 **Benchmark per-impresa**: il modello ha previsto un aggregato "
+                    f"di settore pari a **{benchmark_agg:,.2f} M€** per "
+                    f"**{n_ent_v:,.0f} PMI** in {val_paese} – {val_settore} ({val_anno}). "
+                    f"Diviso per il numero di imprese, il benchmark per singola PMI è "
+                    f"**{benchmark_pe:,.4f} M€**. È questo il valore con cui viene "
+                    "confrontato il dato inserito."
+                )
+            else:
+                st.warning(
+                    "⚠️ Numero di imprese (V11110) non disponibile per questa "
+                    "combinazione settore/paese/anno. Il confronto è effettuato "
+                    f"sull'aggregato di settore ({benchmark_agg:,.2f} M€)."
+                )
+
             st.markdown("#### Risultati della valutazione")
 
             k1, k2, k3, k4 = st.columns(4)
             k1.metric(
-                "Benchmark ML (previsto)",
-                f"{benchmark:,.2f}",
-                help=f"Valore atteso dal modello {pay_v['name']}",
+                "Benchmark per PMI (M€)",
+                f"{benchmark:,.4f}" if benchmark < 100 else f"{benchmark:,.2f}",
+                help=(f"Aggregato ML {benchmark_agg:,.0f} M€ ÷ {n_ent_v:,.0f} imprese"
+                      if benchmark_pe else f"Aggregato ML: {benchmark_agg:,.2f} M€"),
             )
             k2.metric(
-                "Valore reale inserito",
-                f"{val_reale:,.2f}",
+                "Valore inserito (M€)",
+                f"{val_reale:,.4f}" if val_reale < 100 else f"{val_reale:,.2f}",
             )
-            k3.metric(
-                "Gap assoluto",
-                f"{gap_abs:+,.2f}",
-                delta=f"{gap_pct:+.1f}%",
-                delta_color="normal",
-            )
+            _delta_col = ("normal" if _orient_v == "positive"
+                          else "inverse" if _orient_v == "cost"
+                          else "off")
+            # Se benchmark negativo il gap% è matematicamente invertito: mostriamo
+            # solo il gap assoluto e una nota, senza la percentuale fuorviante
+            if _bench_negativo:
+                k3.metric(
+                    "Gap assoluto (M€)",
+                    f"{gap_abs:+,.4f}" if abs(gap_abs) < 100 else f"{gap_abs:+,.2f}",
+                    help="Gap% non mostrato: benchmark negativo rende il rapporto non interpretabile",
+                )
+            else:
+                k3.metric(
+                    "Gap vs benchmark",
+                    f"{gap_abs:+,.4f}" if abs(gap_abs) < 100 else f"{gap_abs:+,.2f}",
+                    delta=f"{gap_pct:+.1f}%",
+                    delta_color=_delta_col,
+                )
             if zscore_val is not None:
                 k4.metric(
-                    "Z-score settore",
+                    "Z-score (scala per-PMI)",
                     f"{zscore_val:+.2f} σ",
-                    help="Scostamento dalla media storica del settore in deviazioni standard",
+                    help="Scostamento dalla media storica per singola PMI (σ)",
                 )
 
             # ── Badge profilo ──────────────────────────────────────────────────
-            css_map = {
+            _css_fascia = {
                 "Alta Performance":  "risk-alta",
                 "Media Performance": "risk-media",
                 "Bassa Performance": "risk-bassa",
+                "Efficienza Costi":  "risk-alta",   # costi bassi = verde
+                "Costi Allineati":   "risk-media",
+                "Costi Elevati":     "risk-bassa",  # costi alti = rosso
             }
-            css_badge = css_map.get(profilo_val, "risk-media")
+            css_badge = _css_fascia.get(fascia_interp, "risk-media")
             st.markdown(
-                f"**Profilo di performance:**&nbsp;&nbsp;"
-                f'<span class="{css_badge}">{profilo_val}</span>',
+                f"**Valutazione:**&nbsp;&nbsp;"
+                f'<span class="{css_badge}">{fascia_interp}</span>'
+                + (f"&nbsp;&nbsp;<span style='color:#aaa;font-size:0.85em;'>"
+                   f"(K-Means: {profilo_val})</span>" if profilo_val != "N/D" else ""),
                 unsafe_allow_html=True,
             )
             st.markdown("")
 
-            # ── Grafici: gauge + posizionamento ───────────────────────────────
+            # ── Grafici: gauge + violin ────────────────────────────────────────
             col_g, col_p = st.columns([1.1, 1.9])
 
-            # Gauge chart – z-score
             with col_g:
-                st.markdown("**Posizionamento z-score (±3σ)**")
-                zv = zscore_val if zscore_val is not None else 0.0
+                zv = round(zscore_val, 4) if zscore_val is not None else 0.0
+                # Per costi: i colori delle zone sono INVERTITI
+                if _orient_v == "cost":
+                    _zone_lo = "#eafaf1"   # verde a sinistra (costi bassi = buono)
+                    _zone_hi = "#fde8e8"   # rosso a destra (costi alti = brutto)
+                    _bar_col = ("#27ae60" if zv <= -0.5
+                                else "#e74c3c" if zv >= 0.5
+                                else "#f39c12")
+                    _gauge_title = "Z-score costi (–=efficiente, +=oneroso)"
+                else:
+                    _zone_lo = "#fde8e8"
+                    _zone_hi = "#eafaf1"
+                    _bar_col = ("#27ae60" if zv >= 0.5
+                                else "#e74c3c" if zv <= -0.5
+                                else "#f39c12")
+                    _gauge_title = "Z-score performance (+= sopra media)"
+
                 fig_gauge = go.Figure(go.Indicator(
                     mode="gauge+number+delta",
                     value=zv,
-                    delta={"reference": 0, "suffix": " σ",
-                           "valueformat": "+.2f"},
+                    delta={"reference": 0, "suffix": " σ", "valueformat": "+.2f"},
                     number={"suffix": " σ", "valueformat": "+.2f"},
                     gauge={
                         "axis": {"range": [-3, 3], "tickwidth": 1,
                                  "tickcolor": "#555",
                                  "tickvals": [-3, -2, -1, 0, 1, 2, 3]},
-                        "bar":  {"color": (
-                            "#27ae60" if zv >= 0.5
-                            else "#e74c3c" if zv <= -0.5
-                            else "#f39c12")},
+                        "bar":  {"color": _bar_col},
                         "bgcolor": "white",
                         "steps": [
-                            {"range": [-3, -0.5], "color": "#fde8e8"},
+                            {"range": [-3,  -0.5], "color": _zone_lo},
                             {"range": [-0.5, 0.5], "color": "#fef9e7"},
-                            {"range": [0.5,  3],   "color": "#eafaf1"},
+                            {"range": [ 0.5,  3],  "color": _zone_hi},
                         ],
                         "threshold": {
                             "line": {"color": "#2c3e50", "width": 3},
@@ -1253,52 +1583,69 @@ specificate (paese, settore, anno). Questo valore rappresenta il *benchmark di s
                             "value": zv,
                         },
                     },
-                    title={"text": "Z-score vs media settore"},
+                    title={"text": _gauge_title, "font": {"size": 12}},
                 ))
                 fig_gauge.update_layout(
-                    height=280, margin=dict(l=20, r=20, t=50, b=10),
+                    height=280, margin=dict(l=20, r=20, t=60, b=10),
                     paper_bgcolor="rgba(0,0,0,0)")
                 st.plotly_chart(fig_gauge, use_container_width=True)
 
-            # Grafico posizionamento rispetto alla distribuzione del settore
             with col_p:
-                st.markdown("**Posizionamento vs distribuzione settore**")
-                df_settore = df_full[
-                    (df_full["indic_sb"] == val_indicatore) &
-                    (df_full["nace_r2"] == val_settore)
-                ]["OBS_VALUE"].dropna()
+                # Distribuzione per-impresa (se disponibile), altrimenti aggregato
+                _rng_v = stats_settore_indicatore(val_indicatore, val_settore)
+                _use_pe = (_rng_v is not None and "pe_mediana" in _rng_v
+                           and n_ent_v and n_ent_v > 0)
 
-                if len(df_settore) >= 5:
+                if _use_pe:
+                    # Ricostruisci serie per-impresa dal dataset
+                    _df_v = df_full[
+                        (df_full["indic_sb"] == val_indicatore) &
+                        (df_full["nace_r2"]  == val_settore)
+                    ].merge(
+                        df_full[(df_full["indic_sb"] == "V11110") &
+                                (df_full["nace_r2"]  == val_settore)]
+                        [["geo", "TIME_PERIOD", "OBS_VALUE"]]
+                        .rename(columns={"OBS_VALUE": "n_ent"}),
+                        on=["geo", "TIME_PERIOD"], how="left"
+                    )
+                    _df_v["n_ent"] = pd.to_numeric(
+                        _df_v["n_ent"], errors="coerce").replace(0, np.nan)
+                    _df_v["val_pe"] = _df_v["OBS_VALUE"] / _df_v["n_ent"]
+                    _dist_pe = _df_v["val_pe"].dropna()
+                    _violin_y = _dist_pe
+                    _violin_title = f"Distribuzione per-PMI – {val_settore}"
+                else:
+                    _violin_y = df_full[
+                        (df_full["indic_sb"] == val_indicatore) &
+                        (df_full["nace_r2"]  == val_settore)
+                    ]["OBS_VALUE"].dropna()
+                    _violin_title = f"Distribuzione aggregato – {val_settore}"
+
+                if len(_violin_y) >= 5:
+                    st.markdown(f"**{_violin_title}**")
                     fig_pos = go.Figure()
                     fig_pos.add_trace(go.Violin(
-                        y=df_settore,
-                        name="Distribuzione settore",
-                        box_visible=True,
-                        meanline_visible=True,
-                        fillcolor="#aed6f1",
-                        opacity=0.6,
-                        line_color="#1a5276",
-                        points="outliers",
+                        y=_violin_y,
+                        name="Distribuzione", box_visible=True,
+                        meanline_visible=True, fillcolor="#aed6f1",
+                        opacity=0.6, line_color="#1a5276", points="outliers",
                     ))
-                    # Linea valore reale
                     fig_pos.add_hline(
                         y=val_reale, line_dash="dash", line_color="#e74c3c",
                         line_width=2,
-                        annotation_text=f"La tua azienda: {val_reale:,.0f}",
+                        annotation_text=f"Tua azienda: {val_reale:,.4f}",
                         annotation_position="top right",
                         annotation_font_color="#e74c3c",
                     )
-                    # Linea benchmark
                     fig_pos.add_hline(
                         y=benchmark, line_dash="dot", line_color="#27ae60",
                         line_width=2,
-                        annotation_text=f"Benchmark ML: {benchmark:,.0f}",
+                        annotation_text=f"Benchmark: {benchmark:,.4f}",
                         annotation_position="bottom right",
                         annotation_font_color="#27ae60",
                     )
                     fig_pos.update_layout(
-                        height=280,
-                        margin=dict(l=0, r=0, t=20, b=0),
+                        height=280, margin=dict(l=0, r=0, t=10, b=0),
                         yaxis_title=IND_LABELS[val_indicatore],
                         showlegend=False,
                         paper_bgcolor="rgba(0,0,0,0)",
@@ -1306,66 +1653,104 @@ specificate (paese, settore, anno). Questo valore rappresenta il *benchmark di s
                     )
                     st.plotly_chart(fig_pos, use_container_width=True)
                 else:
-                    st.info("Dati insufficienti per la distribuzione del settore.")
+                    st.info("Dati insufficienti per il grafico di distribuzione.")
 
             # ── Tabella riepilogativa ──────────────────────────────────────────
             st.markdown("---")
             st.markdown("#### Riepilogo analitico")
-
             righe_riepilogo = {
-                "Paese":                     val_paese,
-                "Settore NACE":              f"{val_settore} – {NACE_LABELS.get(val_settore, '')}",
-                "Anno":                      str(val_anno),
-                "Indicatore":                f"{val_indicatore} – {IND_LABELS[val_indicatore]}",
-                "Valore reale (inserito)":   f"{val_reale:,.2f}",
-                "Benchmark ML":              f"{benchmark:,.2f}",
-                "Modello utilizzato":        pay_v["name"],
-                "Gap assoluto":              f"{gap_abs:+,.2f}",
-                "Gap percentuale":           f"{gap_pct:+.1f}%",
-                "Z-score settore":           (f"{zscore_val:+.2f} σ"
-                                              if zscore_val is not None else "N/D"),
-                "Media storica settore":     (f"{mu_val:,.2f}"
-                                              if mu_val is not None else "N/D"),
-                "Dev. std settore (σ)":      (f"{sigma_val:,.2f}"
-                                              if sigma_val is not None else "N/D"),
-                "Profilo di performance":    profilo_val,
+                "Paese":                        val_paese,
+                "Settore NACE":                 f"{val_settore} – {NACE_LABELS.get(val_settore, '')}",
+                "Anno":                         str(val_anno),
+                "Indicatore":                   f"{val_indicatore} – {IND_LABELS[val_indicatore]}",
+                "Orientamento indicatore":      {"positive": "Positivo (↑ meglio)",
+                                                 "cost":     "Costo (↓ meglio)",
+                                                 "count":    "Conteggio settoriale"
+                                                 }.get(_orient_v, _orient_v),
+                "Valore inserito (M€)":         f"{val_reale:,.4f}",
+                "Benchmark per-PMI (M€)":       f"{benchmark:,.4f}" if benchmark_pe else "N/D",
+                "Benchmark aggregato ML (M€)":  f"{benchmark_agg:,.2f}",
+                "N° imprese settore (V11110)":  f"{n_ent_v:,.0f}" if n_ent_v else "N/D",
+                "Gap vs benchmark per-PMI":     f"{gap_abs:+,.4f} ({gap_pct:+.1f}%)",
+                "Z-score (scala per-PMI)":      (f"{zscore_val:+.2f} σ"
+                                                  if zscore_val is not None else "N/D"),
+                "Media storica per-PMI (μ)":    (f"{mu_val:,.4f}" if mu_val else "N/D"),
+                "Dev. std per-PMI (σ)":         (f"{sigma_val:,.4f}" if sigma_val else "N/D"),
+                "Modello ML utilizzato":        pay_v["name"],
+                "Anno cutoff training":         str(pay_v.get("anno_cutoff", "N/D")),
+                "Valutazione":                  fascia_interp,
             }
-            df_riepilogo = pd.DataFrame(
-                list(righe_riepilogo.items()),
-                columns=["Parametro", "Valore"],
-            )
-            st.dataframe(df_riepilogo, use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(list(righe_riepilogo.items()),
+                             columns=["Parametro", "Valore"]),
+                use_container_width=True, hide_index=True)
 
-            # ── Suggerimento manageriale ───────────────────────────────────────
+            # ── Interpretazione manageriale ────────────────────────────────────
             st.markdown("---")
             st.markdown("#### 💡 Interpretazione manageriale")
+            _zstr = (f" (z-score: **{zscore_val:+.2f}σ**)"
+                     if zscore_val is not None else "")
 
-            if profilo_val == "Alta Performance":
-                st.success(
-                    f"L'azienda supera il benchmark di settore del **{gap_pct:+.1f}%** "
-                    f"e si colloca in una zona di **alta performance** "
-                    f"({zscore_val:+.2f}σ sopra la media). "
-                    "Questo risultato suggerisce un vantaggio competitivo strutturale "
-                    "o un periodo di crescita sostenuta."
-                )
-            elif profilo_val == "Media Performance":
-                st.info(
-                    f"L'azienda è allineata con la media del settore "
-                    f"(gap: **{gap_pct:+.1f}%**, z-score: **{zscore_val:+.2f}σ**). "
-                    "Le performance sono in linea con il benchmark, con margini "
-                    "di miglioramento identificabili attraverso le leve operative."
-                )
+            if _orient_v == "cost":
+                # V12150 – Spese per il personale: logica INVERTITA
+                if fascia_interp == "Efficienza Costi":
+                    st.success(
+                        f"✅ **Buona efficienza del costo del lavoro**: le spese per il "
+                        f"personale sono **{gap_pct:+.1f}%** al di sotto del benchmark "
+                        f"per singola PMI{_zstr}. Un costo del lavoro inferiore alla "
+                        "media indica un'organizzazione efficiente. Da verificare che la "
+                        "riduzione dei costi non comprometta capacità produttiva o qualità."
+                    )
+                elif fascia_interp == "Costi Elevati":
+                    st.error(
+                        f"⚠️ **Costi del personale elevati**: le spese per il personale "
+                        f"sono **{abs(gap_pct):.1f}%** superiori al benchmark per singola "
+                        f"PMI{_zstr}. Costi del lavoro significativamente sopra la media "
+                        "del settore possono indicare: forza lavoro più numerosa, retribuzioni "
+                        "più alte o bassa produttività per addetto. Si raccomanda l'analisi "
+                        "del rapporto Costo lavoro / Fatturato (V12150 / V12110) e il "
+                        "confronto con le best practice del settore."
+                    )
+                else:
+                    st.info(
+                        f"ℹ️ **Costi del personale in linea**: gap **{gap_pct:+.1f}%**"
+                        f"{_zstr}. Le spese per il personale sono allineate alla media "
+                        "del settore. Per ottimizzare l'efficienza, analizzare il rapporto "
+                        "V12150 / V12110 (Costo lavoro su Fatturato) rispetto ai competitor."
+                    )
             else:
-                st.warning(
-                    f"L'azienda si trova **al di sotto del benchmark** "
-                    f"di **{abs(gap_pct):.1f}%** (z-score: **{zscore_val:+.2f}σ**). "
-                    "Questo segnale di early warning suggerisce di analizzare "
-                    "i driver di costo o le cause di sottoperformance rispetto "
-                    f"alla media del settore **{val_settore}**."
-                )
+                # Indicatori positivi: V12110, V12120, V12130
+                if fascia_interp == "Alta Performance":
+                    st.success(
+                        f"✅ L'azienda **supera il benchmark per-PMI** del **{gap_pct:+.1f}%**"
+                        f"{_zstr}, posizionandosi in una zona di **alta performance** "
+                        f"rispetto alla media storica del settore **{val_settore}**. "
+                        "Questo suggerisce un vantaggio competitivo o un ciclo di crescita sostenuta."
+                    )
+                elif fascia_interp == "Media Performance":
+                    st.info(
+                        f"ℹ️ L'azienda è **in linea con la media** del settore "
+                        f"(gap: **{gap_pct:+.1f}%**{_zstr}). "
+                        "Le performance sono allineate al benchmark. Esistono margini di "
+                        "miglioramento identificabili attraverso l'ottimizzazione delle "
+                        "leve operative."
+                    )
+                else:
+                    st.error(
+                        f"⚠️ L'azienda si trova **al di sotto del benchmark per-PMI** "
+                        f"del **{abs(gap_pct):.1f}%**{_zstr}. "
+                        "Questo segnale di **early warning** indica una sottoperformance "
+                        f"rispetto alla media storica delle PMI nel settore **{val_settore}**. "
+                        "Si raccomanda un'analisi dei driver di ricavo e un confronto "
+                        "con le aziende nel cluster di Alta Performance."
+                    )
 
             st.caption(
-                f"Analisi effettuata con modello {pay_v['name']} | "
-                f"Anno cutoff training: {pay_v.get('anno_cutoff', 'N/D')} | "
-                "Fonte dati: Eurostat SBS (PMI)"
+                f"Analisi: {pay_v['name']} | Cutoff training: "
+                f"{pay_v.get('anno_cutoff', 'N/D')} | "
+                f"Fonte: Eurostat SBS (PMI) | "
+                f"Benchmark per-PMI = aggregato ÷ {n_ent_v:,.0f} imprese"
+                if n_ent_v else
+                f"Analisi: {pay_v['name']} | Cutoff: {pay_v.get('anno_cutoff', 'N/D')} | "
+                "Fonte: Eurostat SBS (PMI)"
             )
