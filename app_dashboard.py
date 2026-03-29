@@ -13,10 +13,12 @@ Versione 2.0 – Metodologia corretta:
 """
 
 import os, warnings
+import base64 as _b64
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +95,7 @@ NACE_LABELS = {
     "B-E":            "Industria (escluse costruzioni): B+C+D+E",
     "B-F":            "Industria e costruzioni: B+C+D+E+F",
     "B-N":            "Economia delle imprese (B–N)",
-    "B-N_S95_X_K":    "Economia delle imprese – tutti i settori escluso finanza (K)",
+    "B-N_S95_X_K":    "Economia d'impresa (industria, costruzioni e servizi, escluse attività finanziarie)",
     "B-N_X_K":        "Economia delle imprese escluso finanza (K)",
     "C10-C12":        "Manifattura: alimentari, bevande e tabacco",
     "C13-C15":        "Manifattura: tessile, abbigliamento e pelle",
@@ -112,10 +114,10 @@ NACE_LABELS = {
     "MHT":            "Manifattura a media-alta tecnologia",
     "MLT":            "Manifattura a media-bassa tecnologia",
     "LT":             "Manifattura a bassa tecnologia",
-    "KIA":            "Attività knowledge-intensive (KIA) – tutti i settori",
+    "KIA":            "Attività ad alta intensità di conoscenza",
     "KIABI":          "Servizi ad alta intensità di conoscenza – industria",
     "KIABI_X_K":      "KIA – industria escluso finanza (K)",
-    "KIABI_X_K_R90":  "KIA – industria escluso finanza (K) e arti/spettacolo (R90)",
+    "KIABI_X_K_R90":  "Servizi knowledge-intensive alle imprese (escluse finanza e attività ricreative)",
     "LKIA":           "Attività a bassa intensità di conoscenza",
     "SBI":            "Servizi a supporto delle imprese",
     "S95":            "Riparazione di computer e beni personali",
@@ -136,10 +138,6 @@ NACE_LABELS = {
     "R93":            "Sport, divertimento e attività ricreative",
     "S94":            "Attività di organizzazioni associative",
     "S96":            "Altre attività di servizi alla persona",
-    # ── Aggregati Eurostat SBS presenti nel dataset (non codici NACE standard) ──
-    "B-N_S95_X_K":   "Economia d'impresa (industria, costruzioni e servizi, escluse attività finanziarie)",
-    "KIA":            "Attività ad alta intensità di conoscenza",
-    "KIABI_X_K_R90":  "Servizi knowledge-intensive alle imprese (escluse finanza e attività ricreative)",
 }
 
 # ── Nomi completi dei paesi (codici Eurostat → italiano) ──────────────────────
@@ -193,6 +191,8 @@ def nace_label(code: str) -> str:
     """Restituisce 'Descrizione (CODICE)' oppure solo 'CODICE' se descrizione non trovata."""
     desc = NACE_LABELS.get(code, "")
     return f"{desc} ({code})" if desc else code
+
+
 RISK_COLORS = {
     "Bassa Performance": "#e74c3c",
     "Media Performance": "#f39c12",
@@ -236,8 +236,6 @@ def _modelli_validi():
         _pulisci_modelli()
         return False
 
-
-_modelli_presenti = _modelli_validi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -441,17 +439,23 @@ def _addestra_tutti(bar, status):
         stats["sigma"] = stats["sigma"].replace(0, 1).fillna(1)
 
         df_i = df_i.join(stats, on="nace_r2")
-        df_i["mu"]    = df_i["mu"].fillna(df_i[TARGET].median())
+        train_mediana = float(df_i.loc[df_i["TIME_PERIOD"] <= ANNO_CUT, TARGET].median())
+        if pd.isna(train_mediana):
+            train_mediana = float(df_i[TARGET].median())
+        df_i["mu"]    = df_i["mu"].fillna(train_mediana)
         df_i["sigma"] = df_i["sigma"].fillna(1).replace(0, 1)
         df_i["zsc"]   = ((df_i[TARGET] - df_i["mu"])
                          / df_i["sigma"]).clip(-3, 3)
 
         sc   = StandardScaler()
-        Xcl  = sc.fit_transform(df_i[["zsc", "TIME_PERIOD"]])
+        Xcl_train = sc.fit_transform(
+            df_i.loc[df_i["TIME_PERIOD"] <= ANNO_CUT, ["zsc", "TIME_PERIOD"]]
+        )
+        Xcl  = sc.transform(df_i[["zsc", "TIME_PERIOD"]])
         km   = KMeans(n_clusters=3, random_state=RANDOM_STATE, n_init=10)
         lb   = km.fit_predict(Xcl)
 
-        sil  = float(silhouette_score(Xcl, lb))
+        sil  = float(silhouette_score(Xcl_train, km.predict(Xcl_train)))
         rank = km.cluster_centers_[:, 0].argsort()
         lmap = {
             int(rank[0]): "Bassa Performance",
@@ -551,7 +555,6 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 # ── Carica logo come base64 (embedding locale, nessuna dipendenza esterna) ────
-import base64 as _b64
 _LOGO_B64 = ""
 try:
     _logo_path = os.path.join(BASE_DIR, "Unimercatorum_logo.svg.png")
@@ -581,7 +584,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── PRIMO AVVIO ───────────────────────────────────────────────────────────────
-if not _modelli_presenti():
+if not _modelli_validi():
     st.title("PMI Dashboard – Eurostat SBS")
     st.info("Prima esecuzione: addestramento modelli in corso (2-3 minuti).")
     st.markdown("""
@@ -892,25 +895,25 @@ alla media storica del settore, restituendo: 🟢 Alta / 🟡 Media / 🔴 Bassa
                     st.success(f"**Valore previsto: {y_hat:,.2f}**")
                     st.caption(f"{IND_LABELS[ind_sel]} | {p_in} | {s_in} | {a_in}")
 
-                    kd = carica_kmeans(ind_sel)
-                    if kd:
+                    kd_t1 = carica_kmeans(ind_sel)
+                    if kd_t1:
                         try:
-                            if "sector_stats" in kd and s_in in kd["sector_stats"].index:
-                                mu    = float(kd["sector_stats"].loc[s_in, "mu"])
-                                sigma = float(kd["sector_stats"].loc[s_in, "sigma"])
+                            if "sector_stats" in kd_t1 and s_in in kd_t1["sector_stats"].index:
+                                mu    = float(kd_t1["sector_stats"].loc[s_in, "mu"])
+                                sigma = float(kd_t1["sector_stats"].loc[s_in, "sigma"])
                             else:
                                 mu, sigma = float(y_hat), 1.0
                             sigma  = max(sigma, 1e-6)
                             zscore = float(np.clip((y_hat - mu) / sigma, -3, 3))
-                            Xcl    = kd["scaler"].transform([[zscore, a_in]])
-                            prof   = kd["label_map"][int(kd["km"].predict(Xcl)[0])]
+                            Xcl    = kd_t1["scaler"].transform([[zscore, a_in]])
+                            prof   = kd_t1["label_map"][int(kd_t1["km"].predict(Xcl)[0])]
                             css    = {"Bassa Performance": "risk-bassa",
                                       "Media Performance": "risk-media",
                                       "Alta Performance":  "risk-alta"}[prof]
                             st.markdown("**Profilo vs media del settore:**")
                             st.markdown(f'<span class="{css}">{prof}</span>',
                                         unsafe_allow_html=True)
-                            sil = kd.get("silhouette", None)
+                            sil = kd_t1.get("silhouette", None)
                             st.caption(
                                 f"Z-score settore {s_in}: {zscore:+.2f}σ | "
                                 f"Media settore: {mu:,.2f}"
@@ -1096,6 +1099,8 @@ garantendo che il test set non influenzi l'addestramento (*no data leakage*).
             "alla media storica del settore (nace_r2). Una PMI manifatturiera "
             "viene confrontata solo con altre PMI del manifatturiero, non con settori diversi.")
 
+        st.caption(f"Settore visualizzato in questo tab: **{nace_label(settore)}**.")
+
         # Aggregati EU da escludere dalla visualizzazione:
         # EU27_2020 e EU28 sono somme di tutti i paesi → valori 10-20x superiori
         # ai singoli stati → distorcono la scala e non rappresentano singole PMI.
@@ -1103,7 +1108,7 @@ garantendo che il test set non influenzi l'addestramento (*no data leakage*).
         _EU_EXCL = {"EU27_2020", "EU28"}
 
         # Clustering con z-score (su tutti i dati, aggregati EU inclusi)
-        df_cl = df_ind.copy()
+        df_cl = df_ind[df_ind["nace_r2"] == settore].copy()
         if "sector_stats" in kd:
             df_cl = df_cl.join(kd["sector_stats"], on="nace_r2")
             df_cl["mu"]    = df_cl["mu"].fillna(df_cl["OBS_VALUE"].median())
@@ -1126,8 +1131,8 @@ garantendo che il test set non influenzi l'addestramento (*no data leakage*).
             "renderebbero la scala del grafico illeggibile."
         )
 
-        c1, c2 = st.columns([1, 1.6])
-        with c1:
+        t2c1, t2c2 = st.columns([1, 1.6])
+        with t2c1:
             # Distribuzione profili calcolata sui soli paesi singoli
             dist = df_cl_viz["profilo"].value_counts().reset_index()
             dist.columns = ["Profilo", "N"]
@@ -1158,7 +1163,7 @@ garantendo che il test set non influenzi l'addestramento (*no data leakage*).
                        if _dominant == "Alta"
                        else "Il settore mostra segnali di difficoltà diffusa.")
                 )
-        with c2:
+        with t2c2:
             _df_sc = df_cl_viz.sort_values("profilo").copy()
             _df_sc["Paese"]   = _df_sc["geo"].map(geo_label)
             _df_sc["Settore"] = _df_sc["nace_r2"].map(nace_label)
@@ -1221,7 +1226,7 @@ with tab3:
         st.markdown("""
 **Cosa fa questo tab?**
 Confronta le prestazioni di 4 algoritmi di Machine Learning + 1 modello Baseline sullo stesso dataset,
-per ciascuno dei 5 indicatori Eurostat SBS. L'obiettivo è identificare quale modello generalizza meglio
+per ciascuno dei 4 indicatori di performance Eurostat SBS. L'obiettivo è identificare quale modello generalizza meglio
 su dati *mai visti* durante l'addestramento.
 
 **Metodologia di valutazione:**
@@ -1311,8 +1316,8 @@ Confrontarli permette di verificare se la complessità aggiuntiva (Gradient Boos
 un reale beneficio rispetto a modelli più semplici (Ridge), principio noto come **parsimonia del modello**.
 """)
 
-        c1, c2 = st.columns([1.5, 1.5])
-        with c1:
+        t3c1, t3c2 = st.columns([1.5, 1.5])
+        with t3c1:
             st.markdown(f"#### Metriche – `{ind_sel}`")
             show_cols = [c for c in
                          ["Modello", "MAE", "RMSE", "R2",
@@ -1359,7 +1364,7 @@ un reale beneficio rispetto a modelli più semplici (Ridge), principio noto come
                     f"Miglioramento vs Baseline: **+{_guadagno:.4f}** R²"
                 )
 
-        with c2:
+        with t3c2:
             if "R2" in df_ci.columns:
                 fig_r2 = px.bar(
                     df_ci, x="Modello", y="R2", color="Modello",
@@ -1430,7 +1435,7 @@ un reale beneficio rispetto a modelli più semplici (Ridge), principio noto come
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_all, use_container_width=True, key="pc_t3_r2all")
         st.caption(
-            "📊 Ogni gruppo di barre = R² dei 5 modelli per uno degli indicatori. "
+            "📊 Ogni gruppo di barre = R² dei 5 modelli per uno dei 4 indicatori di performance. "
             "Barre più alte = migliore generalizzazione. "
             "Se il Baseline (mediana storica) è già alto, il dataset è molto regolare. "
             "L'etichetta '◀ selezionato' indica l'indicatore corrente della sidebar."
@@ -1469,8 +1474,8 @@ un reale beneficio rispetto a modelli più semplici (Ridge), principio noto come
                 "Se il **Settore** domina: le differenze tra settori economici sono il fattore principale. "
                 "Se l'**Anno** domina: il trend temporale è il driver principale della variabile."
             )
-            fc1, fc2 = st.columns(2)
-            for col_fi, nm_fi in zip([fc1, fc2],
+            t3_fc1, t3_fc2 = st.columns(2)
+            for col_fi, nm_fi in zip([t3_fc1, t3_fc2],
                                      ["Random Forest", "Gradient Boosting"]):
                 with col_fi:
                     st.markdown(f"**{nm_fi}** – `{ind_sel}`")
@@ -1531,8 +1536,8 @@ o reazioni comuni a eventi economici (es. crisi 2008 o pandemia).
 Tabella grezza dei dati Eurostat per il paese e indicatore scelti nella sidebar.
 Mostra i valori originali come forniti da Eurostat, prima di qualsiasi trasformazione ML.
 """)
-    c1, c2 = st.columns(2)
-    with c1:
+    t4c1, t4c2 = st.columns(2)
+    with t4c1:
         st.markdown("#### Mappa geografica")
         anno_m = st.selectbox("Anno", sorted(anni, reverse=True), key="ma")
         dm = (df_full[(df_full["indic_sb"] == ind_sel) &
@@ -1563,7 +1568,7 @@ Mostra i valori originali come forniti da Eurostat, prima di qualsiasi trasforma
             "Passa il mouse su un paese per vedere il valore esatto."
         )
 
-    with c2:
+    with t4c2:
         st.markdown("#### Trend per settore")
 
         # Lista COMPLETA dei settori nel dataset (da tutti gli indicatori),
@@ -1717,8 +1722,6 @@ Mostra i valori originali come forniti da Eurostat, prima di qualsiasi trasforma
 
 # ══ TAB 5 – VALUTAZIONE AZIENDALE ════════════════════════════════════════════
 with tab5:
-    import plotly.graph_objects as go
-
     st.markdown("### 🏢 Valutazione Aziendale")
     st.markdown(
         "Inserisci i dati della tua azienda per confrontarli con il **benchmark "
@@ -1737,14 +1740,15 @@ confronta automaticamente il tuo valore con il **benchmark ML** del settore di r
 
 ### I 4 valori che vedi nei risultati
 
-**📌 Benchmark per PMI (M€)**
+**📌 Benchmark di riferimento**
 Il modello ML (Ridge / Random Forest / Gradient Boosting / MLP) prevede il valore *aggregato* per
-l'intero settore in quel paese e anno. Questo aggregato viene poi diviso per il numero di imprese
-attive nel settore (V11110, fonte Eurostat) per ottenere il valore atteso *per singola PMI*.
+l'intero settore in quel paese e anno. Se il numero di imprese attive nel settore (V11110, fonte Eurostat)
+è disponibile, questo aggregato viene diviso per ottenere il valore atteso *per singola PMI*; in caso contrario
+il confronto resta sull'aggregato settoriale.
 Questo è il punto di riferimento con cui viene confrontato il tuo dato.
 
 **📌 Gap vs benchmark**
-È la differenza tra il tuo valore e il benchmark per PMI.
+È la differenza tra il tuo valore e il benchmark sulla stessa scala del confronto.
 - Valore positivo = la tua azienda è **sopra** il benchmark (🟢 per ricavi/VA, 🔴 per costi)
 - Valore negativo = la tua azienda è **sotto** il benchmark (🔴 per ricavi/VA, 🟢 per costi)
 - La percentuale indica l'entità dello scostamento rispetto al benchmark
@@ -1770,14 +1774,15 @@ Combina z-score e gap percentuale per assegnare una fascia:
 **Gauge (manometro):** mostra lo z-score su una scala da −3σ a +3σ.
 La zona verde indica la direzione desiderabile (destra per ricavi, sinistra per costi).
 
-**Violin plot:** mostra la distribuzione storica di tutte le PMI europee nel settore.
+**Violin plot:** mostra la distribuzione storica europea coerente con la scala del confronto:
+per-PMI quando disponibile, altrimenti aggregata.
 La linea rossa tratteggiata è il tuo valore; la linea verde è il benchmark ML.
 Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), meglio è.
 
 ---
 
-> *Nota: tutti i valori del dataset Eurostat SBS sono **aggregati settoriali** (in M€).
-> Il confronto con la singola PMI è possibile grazie alla normalizzazione per numero di imprese (V11110).*
+> *Nota: i valori del dataset Eurostat SBS sono **aggregati settoriali** (in M€).
+> Quando V11110 è disponibile, il confronto viene riportato a **singola PMI**; altrimenti resta su scala aggregata.*
 """)
 
     st.markdown("---")
@@ -1797,8 +1802,8 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
     _V12130_SETTORI_CON_DATI = sorted(
         df_full[df_full["indic_sb"] == "V12130"]["nace_r2"].unique())
 
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
+    t5_fc1, t5_fc2, t5_fc3 = st.columns(3)
+    with t5_fc1:
         val_paese = st.selectbox(
             "🌍 Paese",
             _PAESI_DATI,
@@ -1811,7 +1816,7 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                 f"⚠️ **{val_paese}** è un aggregato europeo (non un singolo paese). "
                 "Il benchmark per-PMI sarà la media su tutte le PMI dell'UE, "
                 "non quella nazionale.")
-    with fc2:
+    with t5_fc2:
         val_settore = st.selectbox(
             "🏭 Settore NACE",
             _SETTORI_DATI,
@@ -1820,7 +1825,7 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
         )
         if val_settore in NACE_LABELS:
             st.caption(f"ℹ️ {NACE_LABELS[val_settore]}")
-    with fc3:
+    with t5_fc3:
         val_anno = st.number_input(
             "📅 Anno di riferimento",
             min_value=2000, max_value=2035,
@@ -1846,10 +1851,34 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
         if val_indicatore == "V12130" and val_settore == "B":
             st.caption(f"ℹ️ Il Valore aggiunto per {nace_label(val_settore)} può essere negativo in alcuni paesi/anni.")
     with fv2:
+        # ── Verifica V11110 per il paese-settore PRIMA di tutto il resto ──────
+        # Questo determina se il benchmark sarà per-PMI (V11110 disponibile)
+        # o sull'aggregato (V11110 mancante). Hint e default devono essere
+        # coerenti con la scala del benchmark per evitare confronti insensati.
+        _n_ent_hint_vals = df_full[
+            (df_full["indic_sb"] == "V11110") &
+            (df_full["nace_r2"]  == val_settore) &
+            (df_full["geo"]      == val_paese)
+        ]["OBS_VALUE"].dropna()
+        _n_ent_hint = (float(_n_ent_hint_vals.mean())
+                       if len(_n_ent_hint_vals) > 0 and _n_ent_hint_vals.mean() > 0
+                       else None)
+
         # Carica statistiche di settore per range e default realistici
         _rng = stats_settore_indicatore(val_indicatore, val_settore)
-        _default_val = float(round(_rng["mediana"], 2)) if _rng else 1000.0
-        _step_val    = max(1.0, float(round(_rng["std"] / 100, 1))) if _rng else 10.0
+        _has_pe_hint = bool(_rng and "pe_mediana" in _rng)
+
+        # Scala dell'input = per-PMI solo se V11110 disponibile per questo paese
+        _use_pe_scale = _has_pe_hint and (_n_ent_hint is not None)
+
+        if _use_pe_scale:
+            # Guida l'utente a inserire un valore su scala per-singola-impresa
+            _default_val = float(round(_rng["pe_mediana"], 2))
+            _step_val    = max(0.01, float(round(_rng.get("pe_std", 1.0) / 100, 3)))
+        else:
+            # V11110 mancante → benchmark sarà sull'aggregato di settore
+            _default_val = float(round(_rng["mediana"], 2)) if _rng else 1000.0
+            _step_val    = max(1.0, float(round(_rng["std"] / 100, 1))) if _rng else 10.0
 
         _orient_rng = INDICATOR_ORIENTATION.get(val_indicatore, "positive")
         val_reale = st.number_input(
@@ -1863,8 +1892,7 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
 
         # ── Hint rapido: range di valori realistici ────────────────────────────
         if _rng and _orient_rng != "count":
-            _has_pe_hint = "pe_mediana" in _rng
-            if _has_pe_hint:
+            if _use_pe_scale:
                 _hint_lo  = max(0.0, _rng["pe_p5"])
                 _hint_hi  = _rng["pe_p95"]
                 _hint_med = _rng["pe_mediana"]
@@ -1874,34 +1902,46 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                 _hint_hi  = _rng["p95"]
                 _hint_med = _rng["mediana"]
                 _hint_src = "aggregato settoriale europeo"
+                if _has_pe_hint:
+                    # Pe stats esistono a livello europeo, ma V11110 mancante per questo paese:
+                    # avvisa esplicitamente che la scala è quella aggregata
+                    st.caption(
+                        f"⚠️ N° imprese (V11110) non disponibile per "
+                        f"**{GEO_LABELS.get(val_paese, val_paese)}** "
+                        "nel settore selezionato. "
+                        "Il confronto avverrà sull'**aggregato di settore**: "
+                        "inserisci il valore **totale del tuo settore** "
+                        "(non per singola impresa)."
+                    )
+
             _cost_note = " · valori più bassi = maggiore efficienza" if _orient_rng == "cost" else ""
-            # Controlla se esiste un dato storico per il paese selezionato
+
+            # Nota storica per il paese (scala coerente con il benchmark)
             _df_paese_hint = df_full[
                 (df_full["indic_sb"] == val_indicatore) &
                 (df_full["nace_r2"]  == val_settore) &
                 (df_full["geo"]      == val_paese)
             ]["OBS_VALUE"].dropna()
             _paese_note = ""
-            # n_ent_v è disponibile solo dopo il click del bottone;
-            # qui calcoliamo localmente la media imprese per il paese selezionato
-            _n_ent_hint_vals = df_full[
-                (df_full["indic_sb"] == "V11110") &
-                (df_full["nace_r2"]  == val_settore) &
-                (df_full["geo"]      == val_paese)
-            ]["OBS_VALUE"].dropna()
-            _n_ent_hint = (float(_n_ent_hint_vals.mean())
-                           if len(_n_ent_hint_vals) > 0 and _n_ent_hint_vals.mean() > 0
-                           else None)
-            if len(_df_paese_hint) > 0 and _n_ent_hint:
+            if _use_pe_scale and len(_df_paese_hint) > 0 and _n_ent_hint:
                 _med_paese_pe = float(_df_paese_hint.mean()) / _n_ent_hint
                 _paese_note = (
                     f" · Storico **{GEO_LABELS.get(val_paese, val_paese)}** "
                     f"(media per PMI): **{_med_paese_pe:,.2f} M€**"
                 )
+            elif not _use_pe_scale and len(_df_paese_hint) > 0:
+                _med_paese_agg = float(_df_paese_hint.mean())
+                _paese_note = (
+                    f" · Storico **{GEO_LABELS.get(val_paese, val_paese)}** "
+                    f"(media aggregata): **{_med_paese_agg:,.0f} M€**"
+                )
+
+            # Formato numerico: 2 decimali per valori piccoli, 0 per grandi aggregati
+            _hfmt = lambda v: (f"{v:,.2f}" if abs(v) < 1000 else f"{v:,.0f}")
             st.caption(
                 f"📝 Range europeo ({_hint_src}): "
-                f"tra **{_hint_lo:,.2f}** e **{_hint_hi:,.2f}** M€ "
-                f"(P5–P95, mediana {_hint_med:,.2f} M€)"
+                f"tra **{_hfmt(_hint_lo)}** e **{_hfmt(_hint_hi)}** M€ "
+                f"(P5–P95, mediana {_hfmt(_hint_med)} M€)"
                 f"{_cost_note}{_paese_note}"
             )
 
@@ -1955,8 +1995,26 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
             except Exception:
                 pass
 
-            benchmark_pe = (benchmark_agg / n_ent_v
-                            if n_ent_v and n_ent_v > 0 else None)
+            # ── Calcola benchmark per-PMI ──────────────────────────────────────
+            _n_ent_mancante = not (n_ent_v and n_ent_v > 0)
+
+            if not _n_ent_mancante:
+                # Caso normale: V11110 disponibile → benchmark = aggregato ML ÷ n imprese
+                benchmark_pe = benchmark_agg / n_ent_v
+                _bench_pe_fonte = "ml_diviso"   # fonte per il caption
+            else:
+                # V11110 non disponibile per questo paese-settore.
+                # Usare il benchmark aggregato ML (es. 212.933 M€) confrontato con
+                # il valore di una singola azienda (es. 2 M€) è privo di senso.
+                # Fallback metodologicamente corretto: mediana europea per-PMI
+                # calcolata sugli altri paesi che hanno V11110 per questo settore.
+                _rng_fb_pe = stats_settore_indicatore(val_indicatore, val_settore)
+                if _rng_fb_pe and "pe_mediana" in _rng_fb_pe:
+                    benchmark_pe = float(_rng_fb_pe["pe_mediana"])
+                    _bench_pe_fonte = "pe_mediana_eu"   # fonte per il caption
+                else:
+                    benchmark_pe = None
+                    _bench_pe_fonte = "aggregato"
 
             # Usa per-impresa come benchmark primario; aggregato come secondario
             benchmark = benchmark_pe if benchmark_pe is not None else benchmark_agg
@@ -2031,17 +2089,33 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
 
                     # Normalizza mu/sigma alla scala per-impresa
                     if n_ent_v and n_ent_v > 0:
+                        # Caso normale: V11110 disponibile → scala per-PMI esatta
                         mu_val    = mu_agg  / n_ent_v
                         sigma_val = sig_agg / n_ent_v
+                    elif (_rng_settore and
+                          "pe_mediana" in _rng_settore and
+                          "pe_std" in _rng_settore):
+                        # V11110 non disponibile: usa la distribuzione per-PMI europea
+                        # dalla funzione stats_settore_indicatore. Coerente con
+                        # benchmark = pe_mediana e val_reale su scala per-PMI.
+                        mu_val    = float(_rng_settore["pe_mediana"])
+                        sigma_val = float(_rng_settore["pe_std"])
                     else:
+                        # Ultimo fallback: scala aggregata (meno accurato)
                         mu_val    = mu_agg
                         sigma_val = sig_agg
                     sigma_val = max(sigma_val, 1e-9)
 
-                    zscore_val  = float(np.clip(
+                    zscore_val = float(np.clip(
                         (val_reale - mu_val) / sigma_val, -3, 3))
+
+                    # K-Means: il modello è addestrato su dati aggregati →
+                    # ricostruiamo il valore aggregato per il clustering.
+                    # Se n_ent_v è None usiamo _n_ent_hint (stima storica media).
+                    _n_ent_kmeans = (n_ent_v if (n_ent_v and n_ent_v > 0)
+                                     else (_n_ent_hint if _n_ent_hint else 1.0))
                     Xcl_v = kd_v["scaler"].transform(
-                        [[float(np.clip((val_reale * (n_ent_v or 1) - mu_agg) / sig_agg, -3, 3)),
+                        [[float(np.clip((val_reale * _n_ent_kmeans - mu_agg) / sig_agg, -3, 3)),
                           val_anno]])
                     lbl_v = int(kd_v["km"].predict(Xcl_v)[0])
                     profilo_val = kd_v["label_map"].get(lbl_v, "N/D")
@@ -2128,33 +2202,54 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                     "alternativo più robusto."
                 )
 
-            if benchmark_pe is not None:
+            # ── Caption metodologica benchmark ────────────────────────────────
+            if _bench_pe_fonte == "ml_diviso":
                 st.caption(
                     f"📐 Benchmark per singola PMI: **{benchmark_pe:,.4f} M€** "
                     f"(aggregato ML {benchmark_agg:,.2f} M€ ÷ {n_ent_v:,.0f} imprese)"
                 )
+            elif _bench_pe_fonte == "pe_mediana_eu":
+                st.info(
+                    f"ℹ️ **N° imprese (V11110) non disponibile** per "
+                    f"{geo_label(val_paese)} nel settore selezionato. "
+                    f"Il benchmark è stato impostato sulla **mediana europea per singola PMI** "
+                    f"({benchmark_pe:,.2f} M€) calcolata sugli altri paesi Eurostat con dati disponibili. "
+                    "Questo è il riferimento più corretto per confrontare una singola azienda."
+                )
             else:
-                st.caption(
-                    f"⚠️ N° imprese non disponibile – confronto sull'aggregato di settore ({benchmark_agg:,.2f} M€)."
+                st.warning(
+                    f"⚠️ N° imprese non disponibile e dati per-PMI insufficienti. "
+                    f"Confronto sull'aggregato di settore ({benchmark_agg:,.2f} M€): "
+                    "il gap non è interpretabile a livello di singola azienda."
                 )
 
             st.markdown("#### Risultati della valutazione")
 
             k1, k2, k3, k4 = st.columns(4)
+            # Tooltip help differenziato per fonte del benchmark
+            if _bench_pe_fonte == "ml_diviso":
+                _k1_help = (f"Valore atteso dal modello ML per una singola PMI nel settore. "
+                            f"Calcolato come: aggregato ML {benchmark_agg:,.0f} M€ "
+                            f"÷ {n_ent_v:,.0f} imprese attive nel settore.")
+            elif _bench_pe_fonte == "pe_mediana_eu":
+                _k1_help = (f"Mediana europea per-PMI di {IND_LABELS[val_indicatore]} "
+                            f"nel settore {nace_label(val_settore)} (tutti i paesi Eurostat "
+                            f"con V11110 disponibile, 2011–2020). "
+                            f"Usata come riferimento perché V11110 non è disponibile per "
+                            f"{geo_label(val_paese)}.")
+            else:
+                _k1_help = (f"Valore aggregato previsto dal modello ML per l'intero settore: "
+                            f"{benchmark_agg:,.2f} M€. V11110 mancante — confronto su aggregato.")
             k1.metric(
-                "Benchmark per PMI (M€)",
+                "Benchmark per PMI (M€)" if _bench_pe_fonte != "aggregato" else "Benchmark aggregato (M€)",
                 f"{benchmark:,.4f}" if benchmark < 100 else f"{benchmark:,.2f}",
-                help=(f"Valore atteso dal modello ML per una singola PMI nel settore. "
-                      f"Calcolato come: aggregato ML {benchmark_agg:,.0f} M€ ÷ {n_ent_v:,.0f} imprese attive nel settore."
-                      if benchmark_pe else
-                      f"Valore aggregato previsto dal modello ML per l'intero settore: {benchmark_agg:,.2f} M€. "
-                      "Non è stato possibile normalizzare per singola impresa (V11110 mancante)."),
+                help=_k1_help,
             )
             k2.metric(
                 "Valore inserito (M€)",
                 f"{val_reale:,.4f}" if val_reale < 100 else f"{val_reale:,.2f}",
                 help="Il valore che hai inserito per la tua azienda, espresso in milioni di euro (M€). "
-                     "Viene confrontato con il benchmark ML per calcolare il gap e lo z-score.",
+                     "Viene confrontato con il benchmark ML sulla stessa scala del benchmark (per-PMI o aggregata) per calcolare gap e z-score.",
             )
             _delta_col = ("normal" if _orient_v == "positive"
                           else "inverse" if _orient_v == "cost"
@@ -2181,7 +2276,7 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                 )
             if zscore_val is not None:
                 k4.metric(
-                    "Z-score (scala per-PMI)",
+                    ("Z-score (scala per-PMI)" if _bench_pe_fonte != "aggregato" else "Z-score (scala aggregata)"),
                     f"{zscore_val:+.2f} σ",
                     help="Scostamento dalla media storica del settore, espresso in deviazioni standard (σ). "
                          "z > +0.5σ: sopra la media. z < −0.5σ: sotto la media. "
@@ -2272,11 +2367,15 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                     )
 
             with col_p:
-                # Distribuzione per-impresa (se disponibile), altrimenti aggregato
-                # Riusa _rng_settore già calcolato in precedenza (no chiamata doppia)
+                # Distribuzione per-impresa (se disponibile), altrimenti aggregato.
+                # Riusa _rng_settore già calcolato in precedenza (no chiamata doppia).
+                # Mostra per-PMI anche quando n_ent_v è None ma il benchmark è già
+                # su scala per-PMI (caso pe_mediana_eu): il violin usa il cross-country
+                # V11110 e non dipende dal paese specifico.
                 _rng_v = _rng_settore
-                _use_pe = (_rng_v is not None and "pe_mediana" in _rng_v
-                           and n_ent_v and n_ent_v > 0)
+                _use_pe = (_rng_v is not None and "pe_mediana" in _rng_v and
+                           (bool(n_ent_v and n_ent_v > 0) or
+                            _bench_pe_fonte == "pe_mediana_eu"))
 
                 if _use_pe:
                     # Ricostruisci serie per-impresa dal dataset
@@ -2359,8 +2458,10 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                 "Paese / Settore / Anno":   f"{geo_label(val_paese)}  ·  {nace_label(val_settore)}  ·  {val_anno}",
                 "Indicatore":               IND_LABELS[val_indicatore],
                 "Valore inserito (M€)":     f"{val_reale:,.4f}",
-                "Benchmark per PMI (M€)":   (f"{benchmark:,.4f}" if benchmark_pe
-                                             else f"{benchmark_agg:,.2f} (aggregato)"),
+                ("Benchmark per PMI (M€)" if _bench_pe_fonte != "aggregato" else "Benchmark aggregato (M€)"): (
+       						  f"{benchmark:,.4f}" if benchmark_pe
+        					  else f"{benchmark_agg:,.2f} (aggregato)"
+    					 ),                                          
                 "Gap vs benchmark":         (f"{gap_abs:+,.4f} M€  ({gap_pct:+.1f}%)"
                                              if not _bench_negativo
                                              else f"{gap_abs:+,.4f} M€"),
@@ -2555,12 +2656,16 @@ Più la tua linea è in alto nel grafico (per ricavi) o in basso (per costi), me
                     f"Il benchmark ML si basa su questi dati storici."
                 )
 
+            # Lazy: costruisce la stringa solo per il caso attivo (evita TypeError su n_ent_v None)
+            if _bench_pe_fonte == "ml_diviso":
+                _footer_bench = f"Benchmark per-PMI = aggregato ML ÷ {n_ent_v:,.0f} imprese"
+            elif _bench_pe_fonte == "pe_mediana_eu":
+                _footer_bench = "Benchmark per-PMI = mediana europea (V11110 non disponibile per questo paese)"
+            else:
+                _footer_bench = "Benchmark = aggregato ML di settore (V11110 e pe_mediana non disponibili)"
             st.caption(
                 f"Analisi: {pay_v['name']} | Cutoff training: "
                 f"{pay_v.get('anno_cutoff', 'N/D')} | "
-                f"Fonte: Eurostat SBS (PMI) | "
-                f"Benchmark per-PMI = aggregato ÷ {n_ent_v:,.0f} imprese"
-                if n_ent_v else
-                f"Analisi: {pay_v['name']} | Cutoff: {pay_v.get('anno_cutoff', 'N/D')} | "
-                "Fonte: Eurostat SBS (PMI)"
+                f"Fonte: Eurostat SBS (PMI)"
+                + (f" | {_footer_bench}" if _footer_bench else "")
             )
