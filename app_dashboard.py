@@ -453,7 +453,8 @@ def _addestra_tutti(bar, status):
         )
         Xcl  = sc.transform(df_i[["zsc", "TIME_PERIOD"]])
         km   = KMeans(n_clusters=3, random_state=RANDOM_STATE, n_init=10)
-        lb   = km.fit_predict(Xcl)
+        km.fit(Xcl_train)          # addestra solo sul training set
+        lb   = km.predict(Xcl)     # assegna etichette all'intero dataset
 
         sil  = float(silhouette_score(Xcl_train, km.predict(Xcl_train)))
         rank = km.cluster_centers_[:, 0].argsort()
@@ -718,6 +719,135 @@ def stats_settore_indicatore(indicatore: str, settore: str):
     return res
 
 
+@st.cache_data
+def calcola_anomalie():
+    """
+    Scansiona l'intero dataset e restituisce un DataFrame con le anomalie rilevate:
+    - Valori negativi per indicatori che non possono esserlo (V12110/V12120/V12150)
+    - Salti anno/anno > ±200% su anni consecutivi
+    - Anni mancanti nel mezzo di una serie storica
+
+    Eseguita una sola volta e messa in cache (Streamlit cache_data).
+    """
+    df = carica_dati()
+    _EU_AGG = {"EU27_2020", "EU28"}
+    _IND_LABELS_LOC = {
+        "V12110": "Fatturato",
+        "V12120": "Valore della produzione",
+        "V12130": "Valore aggiunto",
+        "V12150": "Spese personale",
+    }
+    rows = []
+
+    for ind in INDICATORS:
+        df_i = df[df["indic_sb"] == ind]
+        for geo in df_i["geo"].unique():
+            if geo in _EU_AGG:
+                continue
+            for nace in df_i["nace_r2"].unique():
+                s = (df_i[(df_i["geo"] == geo) & (df_i["nace_r2"] == nace)]
+                     .sort_values("TIME_PERIOD"))
+                if len(s) < 2:
+                    continue
+                ind_nome = _IND_LABELS_LOC.get(ind, ind)
+
+                # ── 1. Valori negativi impossibili ─────────────────────────────
+                if ind in ("V12110", "V12120", "V12150"):
+                    for _, row in s[s["OBS_VALUE"] < 0].iterrows():
+                        rows.append(dict(
+                            tipo="Valore negativo impossibile",
+                            gravita="alta",
+                            indicatore=ind, geo=geo, settore=nace,
+                            anno=int(row["TIME_PERIOD"]),
+                            valore=round(float(row["OBS_VALUE"]), 2),
+                            spiegazione=(
+                                f"**{ind_nome}** registra un valore negativo "
+                                f"(**{row['OBS_VALUE']:.2f} M€**) che è economicamente "
+                                "impossibile (ricavi e costi del personale non possono essere "
+                                "negativi). Si tratta quasi certamente di un errore di "
+                                "segnalazione o di una revisione statistica Eurostat non "
+                                "ancora corretta. Il modello ML è addestrato su questi dati: "
+                                "usare il benchmark con cautela per questa combinazione."
+                            )
+                        ))
+
+                # ── 2. Salti anno/anno anomali (solo anni consecutivi) ─────────
+                for i in range(1, len(s)):
+                    curr = s.iloc[i]
+                    prev = s.iloc[i - 1]
+                    if pd.isna(curr["OBS_VALUE"]) or pd.isna(prev["OBS_VALUE"]):
+                        continue
+                    if int(curr["TIME_PERIOD"]) != int(prev["TIME_PERIOD"]) + 1:
+                        continue
+                    if prev["OBS_VALUE"] == 0:
+                        continue
+                    yoy = ((curr["OBS_VALUE"] - prev["OBS_VALUE"])
+                           / abs(prev["OBS_VALUE"]) * 100)
+                    if abs(yoy) <= 200:
+                        continue
+                    # V12130/B: salti fisiologici (VA può oscillare attorno allo zero)
+                    if ind == "V12130" and nace == "B":
+                        grav = "media"
+                        spieg = (
+                            f"**{ind_nome}** nel settore estrattivo **(B)** passa da "
+                            f"**{prev['OBS_VALUE']:.1f} M€** ({int(prev['TIME_PERIOD'])}) a "
+                            f"**{curr['OBS_VALUE']:.1f} M€** ({int(curr['TIME_PERIOD'])}), "
+                            f"variazione **{yoy:+.0f}%**. "
+                            "Il Valore Aggiunto nel mining dipende dalla differenza "
+                            "ricavi–costi di estrazione: fluttuazioni nei prezzi delle "
+                            "materie prime possono portarlo a oscillare attorno allo zero "
+                            "generando percentuali astronomiche. Il fenomeno è "
+                            "economicamente plausibile, non un errore nei dati."
+                        )
+                    else:
+                        grav = "alta"
+                        spieg = (
+                            f"**{ind_nome}** registra una variazione di **{yoy:+.0f}%** "
+                            f"in un solo anno ({int(prev['TIME_PERIOD'])}→"
+                            f"{int(curr['TIME_PERIOD'])}): da "
+                            f"**{prev['OBS_VALUE']:.1f}** a "
+                            f"**{curr['OBS_VALUE']:.1f} M€**. "
+                            "Salti così estremi indicano quasi sempre una revisione "
+                            "metodologica Eurostat, un cambio nel perimetro di rilevazione "
+                            "o una correzione retroattiva. Non riflette un cambiamento "
+                            "economico reale avvenuto in un solo anno."
+                        )
+                    rows.append(dict(
+                        tipo="Salto anomalo anno/anno",
+                        gravita=grav,
+                        indicatore=ind, geo=geo, settore=nace,
+                        anno=int(curr["TIME_PERIOD"]),
+                        valore=round(yoy, 1),
+                        spiegazione=spieg
+                    ))
+
+                # ── 3. Anni mancanti nel mezzo della serie ─────────────────────
+                all_yrs = sorted(s["TIME_PERIOD"].dropna().unique())
+                missing = [y for y in range(int(min(all_yrs)) + 1, int(max(all_yrs)))
+                           if y not in all_yrs]
+                if missing:
+                    rows.append(dict(
+                        tipo="Anno/i mancante/i nella serie",
+                        gravita="bassa",
+                        indicatore=ind, geo=geo, settore=nace,
+                        anno=missing[0],
+                        valore=len(missing),
+                        spiegazione=(
+                            f"La serie storica di **{ind_nome}** ha "
+                            f"**{len(missing)} anno/i mancante/i** "
+                            f"(**{', '.join(str(int(y)) for y in missing)}**). "
+                            "Eurostat non ha ricevuto o pubblicato dati per questi anni "
+                            "(common per KIABI_X_K_R90 e KIA nei paesi più piccoli). "
+                            "Il modello ML gestisce le lacune con l'interpolazione "
+                            "implicita del training set, ma le previsioni sugli anni "
+                            "privi di dati storici sono meno affidabili."
+                        )
+                    ))
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["tipo","gravita","indicatore","geo","settore","anno","valore","spiegazione"])
+
+
 df_full = carica_dati()
 paesi   = sorted(df_full["geo"].unique())
 settori = sorted(df_full["nace_r2"].unique())
@@ -769,23 +899,33 @@ with st.sidebar:
         f"**{df_full['nace_r2'].nunique()}** settori\n\n"
         f"Anni: {int(min(anni))}–{int(max(anni))}"
     )
-    # ── KPI rapido: ultimo valore disponibile per paese+indicatore ───────────
-    _df_kpi = df_full[(df_full["indic_sb"] == ind_sel) & (df_full["geo"] == paese)]
+    # ── KPI rapido: ultimo valore disponibile per paese+settore+indicatore ──────
+    # Filtro anche per settore: evita medie su insiemi di settori disomogenei tra
+    # anni (dati mancanti in alcuni anni → confronto non apples-to-apples).
+    _df_kpi = df_full[
+        (df_full["indic_sb"] == ind_sel) &
+        (df_full["geo"]      == paese)   &
+        (df_full["nace_r2"]  == settore)
+    ]
     if len(_df_kpi):
         _kpi_anno = int(_df_kpi["TIME_PERIOD"].max())
         _kpi_vals = _df_kpi[_df_kpi["TIME_PERIOD"] == _kpi_anno]["OBS_VALUE"].dropna()
         if len(_kpi_vals):
-            _kpi_val = float(_kpi_vals.mean())
-            # Calcola delta rispetto all'anno precedente
+            _kpi_val = float(_kpi_vals.iloc[0])   # un solo valore per paese+settore+anno
+            # Calcola delta rispetto all'anno precedente (stesso settore)
             _df_kpi_prev = _df_kpi[_df_kpi["TIME_PERIOD"] == _kpi_anno - 1]["OBS_VALUE"].dropna()
             _kpi_delta = None
             if len(_df_kpi_prev):
-                _kpi_delta = f"{((_kpi_val - float(_df_kpi_prev.mean())) / abs(float(_df_kpi_prev.mean())) * 100):+.1f}% vs {_kpi_anno-1}"
+                _kpi_prev_val = float(_df_kpi_prev.iloc[0])
+                if _kpi_prev_val != 0:
+                    _kpi_delta = f"{((_kpi_val - _kpi_prev_val) / abs(_kpi_prev_val) * 100):+.1f}% vs {_kpi_anno-1}"
             st.metric(
                 f"📊 {IND_LABELS[ind_sel].replace(' (M€)','')} – {_kpi_anno}",
                 f"{_kpi_val:,.0f} M€",
                 delta=_kpi_delta,
-                help=f"Valore più recente di {IND_LABELS[ind_sel]} per {GEO_LABELS.get(paese, paese)} (fonte Eurostat SBS)."
+                help=(f"Valore più recente di {IND_LABELS[ind_sel]} per "
+                      f"{GEO_LABELS.get(paese, paese)} – {NACE_LABELS.get(settore, settore)} "
+                      f"(fonte Eurostat SBS).")
             )
     st.markdown("---")
     pay0 = carica_modello(INDICATORS[0])
@@ -1718,6 +1858,131 @@ Mostra i valori originali come forniti da Eurostat, prima di qualsiasi trasforma
               .sort_values("TIME_PERIOD", ascending=False))
     st.dataframe(df_raw.reset_index(drop=True).head(50), use_container_width=True)
     st.caption(f"Visualizzate max 50 righe su {len(df_raw)} disponibili per {geo_label(paese)} – {ind_sel}")
+
+    # ── Riquadro anomalie e limitazioni Eurostat ──────────────────────────────
+    st.markdown("---")
+    st.markdown("#### ⚠️ Anomalie e limitazioni dei dati Eurostat SBS")
+    st.caption(
+        "Analisi automatica dell'intero dataset: vengono segnalate combinazioni "
+        "paese/settore/indicatore con valori statisticamente o economicamente anomali. "
+        "Conoscere queste limitazioni è importante per interpretare correttamente i "
+        "benchmark ML e i risultati del Tab 5."
+    )
+
+    df_anom = calcola_anomalie()
+
+    # ── Riquadro riepilogo globale ─────────────────────────────────────────────
+    _n_neg  = int((df_anom["tipo"] == "Valore negativo impossibile").sum())
+    _n_salt = int((df_anom["tipo"] == "Salto anomalo anno/anno").sum())
+    _n_miss = int((df_anom["tipo"] == "Anno/i mancante/i nella serie").sum())
+    _n_tot  = len(df_anom)
+
+    _an1, _an2, _an3 = st.columns(3)
+    _an1.metric("🔴 Valori negativi impossibili", _n_neg,
+                help="V12110/V12120/V12150 negativi: economicamente impossibili. "
+                     "Quasi certamente errori di segnalazione Eurostat.")
+    _an2.metric("🟡 Salti anomali anno/anno", _n_salt,
+                help="Variazioni >±200% in un anno consecutivo. "
+                     "Principalmente V12130/B (fisiologico) o revisioni metodologiche.")
+    _an3.metric("🔵 Anni mancanti in serie", _n_miss,
+                help="Anni senza dato nel mezzo della serie storica. "
+                     "Comuni per KIABI_X_K_R90 e KIA nei paesi più piccoli.")
+
+    # ── Filtro contestuale: mostra solo le anomalie rilevanti per la selezione corrente ──
+    _anom_cur = df_anom[df_anom["indicatore"] == ind_sel].copy()
+    _anom_paese = _anom_cur[_anom_cur["geo"] == paese]
+    _anom_settore = _anom_cur[_anom_cur["settore"] == settore]
+
+    with st.expander(
+        f"🔍 Anomalie per la selezione corrente: **{ind_sel}** · "
+        f"**{GEO_LABELS.get(paese, paese)}** · **{NACE_LABELS.get(settore, settore)}**",
+        expanded=True
+    ):
+        _anom_combo = df_anom[
+            (df_anom["indicatore"] == ind_sel) &
+            (df_anom["geo"]        == paese)   &
+            (df_anom["settore"]    == settore)
+        ]
+        if len(_anom_combo) == 0:
+            st.success(
+                f"✅ Nessuna anomalia rilevata per **{ind_sel}** · "
+                f"**{GEO_LABELS.get(paese, paese)}** · "
+                f"**{NACE_LABELS.get(settore, settore)}**."
+            )
+        else:
+            for _, row in _anom_combo.iterrows():
+                _col = {"alta": "error", "media": "warning", "bassa": "info"}[row["gravita"]]
+                getattr(st, _col)(
+                    f"**[{row['tipo']}]** – Anno {int(row['anno'])}  \n"
+                    + row["spiegazione"]
+                )
+
+    # ── Expander: tutte le anomalie per l'indicatore corrente ─────────────────
+    with st.expander(
+        f"📋 Tutte le anomalie per **{ind_sel}** ({len(_anom_cur)} segnalazioni su tutti i paesi/settori)",
+        expanded=False
+    ):
+        if len(_anom_cur) == 0:
+            st.info(f"Nessuna anomalia rilevata per {ind_sel}.")
+        else:
+            # Raggruppamento per tipo e gravità
+            for _tipo in ["Valore negativo impossibile", "Salto anomalo anno/anno",
+                          "Anno/i mancante/i nella serie"]:
+                _sub = _anom_cur[_anom_cur["tipo"] == _tipo]
+                if len(_sub) == 0:
+                    continue
+                _icona = {"Valore negativo impossibile": "🔴",
+                          "Salto anomalo anno/anno":     "🟡",
+                          "Anno/i mancante/i nella serie": "🔵"}[_tipo]
+                st.markdown(f"**{_icona} {_tipo}** – {len(_sub)} casi")
+                _tbl = _sub[["geo", "settore", "anno", "valore"]].copy()
+                _tbl["geo"] = _tbl["geo"].map(lambda c: GEO_LABELS.get(c, c))
+                _tbl["settore"] = _tbl["settore"].map(lambda s: NACE_LABELS.get(s, s))
+                if _tipo == "Salto anomalo anno/anno":
+                    _tbl = _tbl.rename(columns={"valore": "Var% YoY"})
+                    _tbl["Var% YoY"] = _tbl["Var% YoY"].map(lambda v: f"{v:+.0f}%")
+                elif _tipo == "Anno/i mancante/i nella serie":
+                    _tbl = _tbl.rename(columns={"anno": "Primo anno mancante", "valore": "N° anni mancanti"})
+                else:
+                    _tbl = _tbl.rename(columns={"valore": "Valore (M€)"})
+                st.dataframe(_tbl, use_container_width=True, hide_index=True)
+
+    # ── Nota metodologica generale ─────────────────────────────────────────────
+    with st.expander("📖 Come interpretare queste segnalazioni", expanded=False):
+        st.markdown("""
+### Perché esistono queste anomalie?
+
+I dati Eurostat SBS sono raccolti tramite indagini statistiche nazionali e poi armonizzati
+a livello europeo. Questo processo può introdurre:
+
+**🔴 Valori negativi impossibili** *(V12110, V12120, V12150)*
+Fatturato, produzione e spese del personale non possono essere negativi economicamente.
+Quando appaiono, si tratta di:
+- Errori di codifica nella segnalazione nazionale a Eurostat
+- Revisioni statistiche non ancora propagate a tutte le serie
+- Valori "placeholder" usati da alcune agenzie statistiche per indicare dati confidenziali
+
+**🟡 Salti anomali anno/anno**
+Una variazione >200% in un anno consecutivo è quasi sempre metodologica, non economica:
+- **V12130 (Valore Aggiunto) settore B (Mining)**: è l'eccezione — il VA può oscillare
+  attorno allo zero perché dipende da ricavi–costi di estrazione (prezzi materie prime).
+  Le percentuali diventano infinite quando il valore di partenza è vicino a zero.
+- **Altri indicatori**: cambio nel perimetro della rilevazione, revisione retroattiva,
+  o correzione di un errore precedente. Non riflette un evento economico reale.
+
+**🔵 Anni mancanti**
+Molto comuni per i settori aggregati come `KIABI_X_K_R90` e `KIA`, perché:
+- La classificazione di queste attività è relativamente recente
+- Non tutti i paesi (specialmente i più piccoli) hanno serie storiche complete
+- Eurostat pubblica i dati solo quando soddisfano certi standard di qualità
+
+### Impatto sui modelli ML
+
+Il modello ML è addestrato sull'intero dataset, anomalie incluse. Questo può significare:
+- **Benchmark poco affidabili** per le combinazioni paese/settore con molte anomalie
+- **Previsioni out-of-range** per settori con forte oscillazione storica (V12130/B)
+- Il tab **Valutazione Aziendale (Tab 5)** mostra avvisi specifici quando rileva questi casi
+""")
 
 
 # ══ TAB 5 – VALUTAZIONE AZIENDALE ════════════════════════════════════════════
